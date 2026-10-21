@@ -31,6 +31,40 @@ MAGENTA='\033[0;35m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
+# Load API keys from the repository root .env, if present.
+# Plain KEY=VALUE parsing only: the file is data, not shell code.
+load_env_file() {
+    local env_file="$1"
+    [ -f "$env_file" ] || return 0
+
+    local line key value
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+
+        key="${line%%=*}"
+        value="${line#*=}"
+        # Strip one layer of surrounding quotes
+        value="${value%\"}"; value="${value#\"}"
+        value="${value%\'}"; value="${value#\'}"
+
+        case "$key" in
+            ''|*[!A-Za-z0-9_]*) continue ;;
+        esac
+
+        # Real environment variables win over the file
+        if [ -z "${!key:-}" ]; then
+            export "$key=$value"
+        fi
+    done < "$env_file"
+}
+
+_MULTI_PROVIDER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+load_env_file "$_MULTI_PROVIDER_DIR/../.env"
+
 # ============================================================================
 # HELPER FUNCTIONS FOR KEY-VALUE STORAGE
 # ============================================================================
@@ -78,12 +112,14 @@ increment_counter() {
 setup_multi_provider_system() {
     
     # Create tracking directory
-    mkdir -p "./multi_provider_logs"
+    # Logs live outside the project so runs do not litter the working tree
+    MULTI_PROVIDER_LOG_DIR="${MULTI_PROVIDER_LOG_DIR:-/tmp/multi_provider_logs}"
+    mkdir -p "$MULTI_PROVIDER_LOG_DIR"
     
     # Initialize provider configuration
     cat > "$PROVIDER_CONFIG_FILE" << EOF
-gemini:gemini-1.5-flash-latest=model:0.000075:0.0003:15:1500
-gemini:gemini-1.5-pro-latest=model:0.00125:0.005:2:50
+gemini:gemini-3-flash-preview=model:0.000075:0.0003:15:1500
+gemini:gemini-3.1-pro-preview=model:0.00125:0.005:2:50
 groq:llama-3.1-70b-versatile=model:0.00059:0.00079:30:14400
 groq:llama-3.1-8b-instant=model:0.00005:0.00008:30:14400
 groq:mixtral-8x7b-32768=model:0.00024:0.00024:30:14400
@@ -99,8 +135,8 @@ EOF
     
     # Initialize provider delays (seconds)
     cat > "$PROVIDER_DELAYS_FILE" << EOF
-gemini:gemini-1.5-flash-latest=4
-gemini:gemini-1.5-pro-latest=30
+gemini:gemini-3-flash-preview=4
+gemini:gemini-3.1-pro-preview=30
 groq:llama-3.1-70b-versatile=2
 groq:llama-3.1-8b-instant=2
 groq:mixtral-8x7b-32768=2
@@ -123,7 +159,10 @@ EOF
     # Test and initialize providers
     local available_count=0
     
-    # Test Gemini providers
+    # Test Gemini providers, falling back to the lite model when the primary
+    # model has no quota left for the day.
+    local gemini_ok=0
+    local gemini_model=""
     for i in {1..5}; do
         local key_var="GEMINI_API_KEY"
         if [ $i -gt 1 ]; then
@@ -132,16 +171,44 @@ EOF
         
         local api_key=$(eval echo \$$key_var)
         if [ -n "$api_key" ]; then
-            if test_gemini_provider "$api_key"; then
-                set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-1.5-flash-latest:$i" "available"
+            if test_gemini_provider "$api_key" "gemini-3-flash-preview"; then
+                set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3-flash-preview:$i" "available"
+                gemini_ok=1
+                gemini_model="gemini-3-flash-preview"
+                ((available_count++))
+            elif test_gemini_provider "$api_key" "gemini-3.1-flash-lite"; then
+                set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-flash-lite:$i" "available"
+                gemini_ok=1
+                gemini_model="gemini-3.1-flash-lite"
                 ((available_count++))
             else
-                set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-1.5-flash-latest:$i" "error"
+                set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3-flash-preview:$i" "error"
+                set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-flash-lite:$i" "error"
             fi
         else
-            set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-1.5-flash-latest:$i" "missing_key"
+            set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3-flash-preview:$i" "missing_key"
+            set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-flash-lite:$i" "missing_key"
         fi
     done
+
+    # smart_api_call looks providers up by model name, without the key index,
+    # so the per-key status alone is not enough to select Gemini.
+    if [ "$gemini_model" = "gemini-3-flash-preview" ]; then
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3-flash-preview" "available"
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-flash-lite" "unavailable"
+    elif [ "$gemini_model" = "gemini-3.1-flash-lite" ]; then
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3-flash-preview" "unavailable"
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-flash-lite" "available"
+    else
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3-flash-preview" "unavailable"
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-flash-lite" "unavailable"
+    fi
+
+    if [ "$gemini_ok" -eq 1 ]; then
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-pro-preview" "available"
+    else
+        set_config "$PROVIDER_STATUS_FILE" "gemini:gemini-3.1-pro-preview" "unavailable"
+    fi
     
     # Test Groq
     if [ -n "$GROQ_API_KEY" ]; then
@@ -239,7 +306,8 @@ EOF
 
 test_gemini_provider() {
     local api_key="$1"
-    local test_url="https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+    local model="${2:-gemini-3-flash-preview}"
+    local test_url="https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent"
     
     local payload=$(cat << EOF
 {
@@ -253,7 +321,7 @@ test_gemini_provider() {
 EOF
 )
     
-    local response=$(curl -s -w "%{http_code}" \
+    local response=$(curl -s --max-time 20 --connect-timeout 10 -w "%{http_code}" \
         -H "Content-Type: application/json" \
         -H "x-goog-api-key: $api_key" \
         -d "$payload" \
@@ -312,25 +380,36 @@ smart_api_call() {
     local temperature="${4:-0.7}"
     local max_tokens="${5:-4096}"
     local max_retries="${6:-$MAX_RETRIES_PER_REQUEST}"
+    local preferred_model="${7:-}"
     
     local providers=()
     
     # Select providers based on task type
     case "$task_type" in
         "fast")
-            providers=("ollama:llama3.2:1b" "ollama:qwen2.5:1.5b" "ollama:gemma2:2b" "groq:llama-3.1-8b-instant" "ollama:llama3.2:3b" "gemini:gemini-1.5-flash-latest")
+            providers=("ollama:llama3.2:1b" "ollama:qwen2.5:1.5b" "ollama:gemma2:2b" "groq:llama-3.1-8b-instant" "ollama:llama3.2:3b" "gemini:gemini-3-flash-preview" "gemini:gemini-3.1-flash-lite")
             ;;
         "creative")
-            providers=("ollama:llama3.2:1b" "ollama:llama3.2:3b" "ollama:qwen2.5:3b" "groq:llama-3.1-70b-versatile" "ollama:phi3.5:3.8b" "gemini:gemini-1.5-pro-latest" "ollama:llama3.1:8b")
+            providers=("ollama:llama3.2:1b" "ollama:llama3.2:3b" "ollama:qwen2.5:3b" "groq:llama-3.1-70b-versatile" "ollama:phi3.5:3.8b" "gemini:gemini-3.1-pro-preview" "gemini:gemini-3-flash-preview" "gemini:gemini-3.1-flash-lite" "ollama:llama3.1:8b")
             ;;
         "analytical")
-            providers=("gemini:gemini-1.5-pro-latest" "ollama:qwen2.5:3b" "groq:llama-3.1-70b-versatile" "ollama:llama3.2:3b" "ollama:llama3.1:8b")
+            providers=("gemini:gemini-3.1-pro-preview" "gemini:gemini-3-flash-preview" "gemini:gemini-3.1-flash-lite" "ollama:qwen2.5:3b" "groq:llama-3.1-70b-versatile" "ollama:llama3.2:3b" "ollama:llama3.1:8b")
             ;;
         *)
-            providers=("ollama:llama3.2:3b" "ollama:qwen2.5:1.5b" "gemini:gemini-1.5-flash-latest" "groq:llama-3.1-8b-instant" "ollama:llama3.1:8b")
+            providers=("ollama:llama3.2:3b" "ollama:qwen2.5:1.5b" "gemini:gemini-3-flash-preview" "gemini:gemini-3.1-flash-lite" "groq:llama-3.1-8b-instant" "ollama:llama3.1:8b")
             ;;
     esac
     
+    # An explicitly requested model is tried first. Bare model names are
+    # treated as Ollama models, matching how callers pass them.
+    if [ -n "$preferred_model" ]; then
+        case "$preferred_model" in
+            ollama:*|gemini:*|groq:*) ;;
+            *) preferred_model="ollama:$preferred_model" ;;
+        esac
+        providers=("$preferred_model" "${providers[@]}")
+    fi
+
     # Try each provider
     for provider_model in "${providers[@]}"; do
         if is_provider_available "$provider_model"; then
@@ -353,8 +432,8 @@ smart_api_call() {
     #             key_var="GEMINI_API_KEY_$i"
     #         fi
             
-    #         if [ -n "${!key_var}" ] && is_provider_available "gemini:gemini-1.5-flash-latest:$i"; then
-    #             if call_gemini_provider "gemini-1.5-flash-latest" "$prompt" "$system_prompt" "$temperature" "$max_tokens" "${!key_var}"; then
+    #         if [ -n "${!key_var}" ] && is_provider_available "gemini:gemini-3-flash-preview:$i"; then
+    #             if call_gemini_provider "gemini-3-flash-preview" "$prompt" "$system_prompt" "$temperature" "$max_tokens" "${!key_var}"; then
     #                 echo "$result"
     #                 return 0
     #             fi
@@ -418,23 +497,32 @@ call_gemini_provider() {
         --arg prompt "$prompt" \
         --arg temp "$temperature" \
         --arg max "$max_tokens" \
+        --arg model "$model" \
         '{
             "contents": [{
                 "parts": [{"text": ($system + "\n\n" + $prompt)}]
             }],
-            "generationConfig": {
+            "generationConfig": ({
                 "temperature": ($temp | tonumber),
                 "maxOutputTokens": ($max | tonumber)
-            }
+            } + (if ($model | test("flash")) then
+                    {"thinkingConfig": {"thinkingBudget": 0}}
+                 else {} end))
         }')
     
-    local response=$(curl -s \
+    local response=$(curl -s --max-time 120 --connect-timeout 10 \
         -H "Content-Type: application/json" \
         -H "x-goog-api-key: $api_key" \
         -d "$payload" \
         "$url")
     
     if echo "$response" | jq -e '.candidates[0].content.parts[0].text' >/dev/null 2>&1; then
+        local finish_reason=$(echo "$response" | jq -r '.candidates[0].finishReason // empty')
+        if [ "$finish_reason" = "MAX_TOKENS" ]; then
+            record_provider_usage "gemini:$model" "truncated"
+            echo "⚠️ Gemini response hit the token limit and was truncated" >&2
+            return 1
+        fi
         result=$(echo "$response" | jq -r '.candidates[0].content.parts[0].text')
         record_provider_usage "gemini:$model" "success"
         return 0
@@ -560,7 +648,7 @@ record_provider_usage() {
     fi
     
     # Log to file
-    echo "$(date '+%Y-%m-%d %H:%M:%S'),$provider_model,$status" >> "./multi_provider_logs/usage.log"
+    echo "$(date '+%Y-%m-%d %H:%M:%S'),$provider_model,$status" >> "${MULTI_PROVIDER_LOG_DIR:-/tmp/multi_provider_logs}/usage.log"
 }
 
 is_provider_available() {
@@ -761,7 +849,7 @@ test_all_providers() {
     local test_system="You are a helpful assistant."
     
     # Test priority models for M3 MacBook Air
-    for provider_model in "ollama:llama3.2:1b" "ollama:qwen2.5:1.5b" "ollama:gemma2:2b" "gemini:gemini-1.5-flash-latest" "groq:llama-3.1-8b-instant"; do
+    for provider_model in "ollama:llama3.2:1b" "ollama:qwen2.5:1.5b" "ollama:gemma2:2b" "gemini:gemini-3-flash-preview" "groq:llama-3.1-8b-instant"; do
         echo -n "Testing $provider_model: "
         
         if call_provider "$provider_model" "$test_prompt" "$test_system" 0.7 50 >/dev/null 2>&1; then

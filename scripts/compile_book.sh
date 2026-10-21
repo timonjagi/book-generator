@@ -9,6 +9,17 @@ set -e
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# TeX Live installs into /Library/TeX/texbin via /etc/paths.d, which only
+# login shells read. Make PDF export work from any shell.
+if [ -d /Library/TeX/texbin ] && ! command -v pdflatex >/dev/null 2>&1; then
+    export PATH="/Library/TeX/texbin:$PATH"
+fi
+
+# Calibre installs its CLI inside the app bundle on macOS
+if ! command -v ebook-convert >/dev/null 2>&1 && [ -x /Applications/calibre.app/Contents/MacOS/ebook-convert ]; then
+    export PATH="/Applications/calibre.app/Contents/MacOS:$PATH"
+fi
+
 # Check for required tools
 check_requirements() {
     local missing_tools=()
@@ -1425,23 +1436,32 @@ All intellectual property rights, including copyrights, in this book are owned b
 ::: {.pagebreak}
 :::
 
-<!-- LaTeX/PDF only - back covers -->
-\pagenumbering{gobble}
-\newgeometry{margin=0mm,top=0mm,bottom=0mm,left=0mm,right=0mm}
-\begin{center}
-\includegraphics[width=\paperwidth,height=\paperheight,keepaspectratio=false]{back-cover-1.png}
-\includegraphics[width=\paperwidth,height=\paperheight,keepaspectratio=false]{back-cover.png}
-\end{center}
-\restoregeometry
+<!-- LaTeX/PDF only - back covers (only when the images exist) -->
+$(if [ -f "$EXPORTS_DIR/back-cover-1.png" ] || [ -f "$EXPORTS_DIR/back-cover.png" ]; then
+    echo '\pagenumbering{gobble}'
+    echo '\newgeometry{margin=0mm,top=0mm,bottom=0mm,left=0mm,right=0mm}'
+    echo '\begin{center}'
+    if [ -f "$EXPORTS_DIR/back-cover-1.png" ]; then
+        echo '\includegraphics[width=\paperwidth,height=\paperheight,keepaspectratio=false]{back-cover-1.png}'
+    fi
+    if [ -f "$EXPORTS_DIR/back-cover.png" ]; then
+        echo '\includegraphics[width=\paperwidth,height=\paperheight,keepaspectratio=false]{back-cover.png}'
+    fi
+    echo '\end{center}'
+    echo '\restoregeometry'
+fi)
 
 <!-- EPUB_ONLY_BEGIN -->
-<div class="backcover-container">
-![](back-cover-1.png){width=100% height=100vh}
-</div>
-
-<div class="backcover-container">
-![](back-cover.png){width=100% height=100vh}
-</div>
+$(if [ -f "$EXPORTS_DIR/back-cover-1.png" ]; then
+    echo '<div class="backcover-container">'
+    echo '![](back-cover-1.png){width=100% height=100vh}'
+    echo '</div>'
+fi)
+$(if [ -f "$EXPORTS_DIR/back-cover.png" ]; then
+    echo '<div class="backcover-container">'
+    echo '![](back-cover.png){width=100% height=100vh}'
+    echo '</div>'
+fi)
 <!-- EPUB_ONLY_END -->
 
 EOF
@@ -1769,7 +1789,7 @@ generate_ebook_format() {
                 if [ -n "$cover_basename" ]; then
                     if [ -n "$back_md" ]; then
                         pandoc -f markdown -t epub3 \
-                            --epub-cover-image="$COVER1_BASENAME" \
+                            --epub-cover-image="$cover_basename" \
                             --css="$css_basename" \
                             --metadata-file="$metadata_basename" \
                             --toc --toc-depth=2 --resource-path=. \
@@ -1777,7 +1797,7 @@ generate_ebook_format() {
                             --split-level=1 -o "$(basename "$output_file")" "$input_basename"
                     else
                         pandoc -f markdown -t epub3 \
-                            --epub-cover-image="$COVER1_BASENAME" \
+                            --epub-cover-image="$cover_basename" \
                             --css="$css_basename" \
                             --metadata-file="$metadata_basename" \
                             --toc --toc-depth=2 --resource-path=. \
@@ -1888,7 +1908,9 @@ generate_ebook_format() {
 \usepackage{titlesec}
 \usepackage{tocloft}
 
-\cftpagenumbersoff{section}
+% \cftpagenumbersoff{section} is incompatible with TeX Live 2026's TOC
+% tagging support (fails with "You can't use \relax after \the" on the
+% second LaTeX pass). Chapter page numbers now show in the TOC.
 \cftpagenumberson{subsection}
 
 \titleformat{\section}{\fontsize{28}{32}\selectfont\bfseries}{\thesection}{1em}{}
